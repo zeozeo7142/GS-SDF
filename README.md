@@ -71,6 +71,137 @@ If you use GS-SDF for your academic research, please cite the following paper.
   make -j8
 ```
 
+
+#### Troubleshooting1: Directly patch labeled_partition to work in CUDA 11.8
+```bash
+cat > /tmp/patch_labeled_partition.py << 'EOF'
+import re
+
+# 패치할 파일 목록
+files = [
+    "/ws/gs_sdf_ws/src/GS-SDF/submodules/gsplat_cpp/submodules/gsplat/gsplat/cuda/csrc/Projection2DGSFused.cu",
+    "/ws/gs_sdf_ws/src/GS-SDF/submodules/gsplat_cpp/submodules/gsplat/gsplat/cuda/csrc/Projection2DGSPacked.cu",
+    "/ws/gs_sdf_ws/src/GS-SDF/submodules/gsplat_cpp/submodules/gsplat/gsplat/cuda/csrc/ProjectionEWA3DGSFused.cu",
+    "/ws/gs_sdf_ws/src/GS-SDF/submodules/gsplat_cpp/submodules/gsplat/gsplat/cuda/csrc/ProjectionEWA3DGSPacked.cu",
+]
+
+# labeled_partition 대체 헬퍼 함수 (파일 상단에 추가)
+helper = '''
+// CUDA 11.8 compatibility: labeled_partition replacement
+#if __CUDACC_VER_MAJOR__ < 12
+namespace cg = cooperative_groups;
+template<typename T>
+__device__ inline cooperative_groups::coalesced_group labeled_partition_compat(
+    cooperative_groups::coalesced_group const& warp, T key) {
+    unsigned int mask = __match_any_sync(warp.ballot(1), (unsigned long long)key);
+    return cooperative_groups::coalesced_threads();
+}
+#define LABELED_PARTITION(warp, key) cooperative_groups::coalesced_threads()
+#else
+#define LABELED_PARTITION(warp, key) cg::labeled_partition(warp, key)
+#endif
+'''
+
+for fpath in files:
+    with open(fpath, 'r') as f:
+        content = f.read()
+
+    # 이미 패치됐으면 스킵
+    if 'LABELED_PARTITION' in content:
+        print(f"Already patched: {fpath}")
+        continue
+
+    # labeled_partition 호출을 매크로로 교체
+    content = content.replace(
+        'cg::labeled_partition(warp, gid)',
+        'LABELED_PARTITION(warp, gid)'
+    )
+    content = content.replace(
+        'cg::labeled_partition(warp, cid)',
+        'LABELED_PARTITION(warp, cid)'
+    )
+
+    # 첫 번째 #include 다음에 헬퍼 삽입
+    content = re.sub(
+        r'(#include\s+<cooperative_groups\.h>)',
+        r'\1' + helper,
+        content,
+        count=1
+    )
+    # cooperative_groups.h include가 없으면 첫 #include 앞에 추가
+    if 'LABELED_PARTITION' not in content or helper not in content:
+        first_include = content.find('#include')
+        if first_include != -1:
+            content = content[:first_include] + helper + '\n' + content[first_include:]
+
+    with open(fpath, 'w') as f:
+        f.write(content)
+    print(f"Patched: {fpath}")
+
+print("Done!")
+EOF
+
+python3 /tmp/patch_labeled_partition.py
+```
+
+#### Troubleshooting2: tiny-cuda-nn, tcnn_binding build
+```bash
+cat > /ws/gs_sdf_ws/fix_and_build.sh << 'EOF'
+#!/bin/bash
+set -e
+
+WORKSPACE="/ws/gs_sdf_ws"
+FLAGS_MAKE="$WORKSPACE/build/GS-SDF/submodules/tcnn_binding/submodules/tiny-cuda-nn/CMakeFiles/tiny-cuda-nn.dir/flags.make"
+
+echo "=== Step 1: cmake 단계만 실행 ==="
+cd "$WORKSPACE"
+rm -rf build devel
+
+export TCNN_CUDA_ARCHITECTURES=86
+export CPLUS_INCLUDE_PATH=/usr/include/python3.8:$CPLUS_INCLUDE_PATH
+export C_INCLUDE_PATH=/usr/include/python3.8:$C_INCLUDE_PATH
+
+# cmake만 실행 (make는 실행하지 않음)
+cmake /ws/gs_sdf_ws/src \
+    -DENABLE_ROS=ON \
+    -DPYTHON_INCLUDE_DIR=/usr/include/python3.8 \
+    -DPYTHON_LIBRARY=/usr/lib/x86_64-linux-gnu/libpython3.8.so \
+    -DCMAKE_CUDA_ARCHITECTURES=86 \
+    -DCMAKE_CUDA_FLAGS="" \
+    -DCATKIN_DEVEL_PREFIX=/ws/gs_sdf_ws/devel \
+    -DCMAKE_INSTALL_PREFIX=/ws/gs_sdf_ws/install \
+    -G "Unix Makefiles" \
+    -B /ws/gs_sdf_ws/build
+
+echo ""
+echo "=== Step 2: tiny-cuda-nn flags.make 수정 ==="
+python3 -c "
+import shutil
+f = '$FLAGS_MAKE'
+shutil.copy2(f, f + '.bak')
+lines = open(f).readlines()
+new = []
+for l in lines:
+    if l.startswith('CUDA_FLAGS'):
+        l = 'CUDA_FLAGS = --expt-relaxed-constexpr --expt-extended-lambda --extended-lambda -Xcompiler=-Wno-float-conversion -Xcompiler=-fno-strict-aliasing -Xcudafe=--diag_suppress=unrecognized_gcc_pragma --generate-code=arch=compute_86,code=[compute_86,sm_86] -Xcompiler=-fPIC -std=c++14\n'
+        print('새 CUDA_FLAGS 적용:', l[:80], '...')
+    new.append(l)
+open(f, 'w').writelines(new)
+print('flags.make 수정 완료')
+"
+
+echo ""
+echo "=== Step 3: make 실행 ==="
+make -j8 -C /ws/gs_sdf_ws/build
+
+echo ""
+echo "=== 빌드 완료 ==="
+EOF
+
+chmod +x /ws/gs_sdf_ws/fix_and_build.sh
+bash /ws/gs_sdf_ws/fix_and_build.sh
+```
+
 ## 4. Data Preparation
 
 - The processed FAST-LIVO2 Datasets and Replica Extrapolation Datasets are available at [M2Mapping Datasets](https://furtive-lamprey-00b.notion.site/M2Mapping-Datasets-e6318dcd710e4a9d8a4f4b3fbe176764)
